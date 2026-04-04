@@ -1,40 +1,39 @@
-"""Получение списка всех активных фьючерсных пар KuCoin."""
+"""Получение списка всех активных линейных (USDT) фьючерсных пар Bybit."""
 
 import logging
 import aiohttp
 
 logger = logging.getLogger(__name__)
 
-CONTRACTS_URL = "https://api-futures.kucoin.com/api/v1/contracts/active"
+INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info?category=linear"
+
+EXCLUDED_SYMBOLS = {"BANANAS31USDT", "PUMPFUNUSDT"}
 
 
 async def fetch_all_symbols() -> list[str]:
-    """Возвращает список символов вида ['XBTUSDTM', 'ETHUSDTM', ...].
+    """Возвращает список символов вида ['BTCUSDT', 'ETHUSDT', ...].
 
-    KuCoin Futures использует суффикс M для perpetual контрактов.
-    Фильтруем только USDT-маржинальные.
+    Bybit linear perpetuals, фильтруем исключения.
     """
     symbols: list[str] = []
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(CONTRACTS_URL) as resp:
+            async with session.get(INSTRUMENTS_URL) as resp:
                 data = await resp.json()
-                for contract in data.get("data", []):
-                    symbol = contract.get("symbol", "")
-                    settle = contract.get("settleCurrency", "")
-                    status = contract.get("status", "")
-                    # Только активные USDT-маржинальные контракты
-                    if settle == "USDT" and status == "Open":
-                        symbols.append(symbol)
-        logger.info("Fetched %d active USDT futures symbols", len(symbols))
+                for item in data.get("result", {}).get("list", []):
+                    sym = item.get("symbol", "")
+                    if sym and sym not in EXCLUDED_SYMBOLS:
+                        symbols.append(sym)
+        logger.info("Fetched %d active Bybit linear symbols", len(symbols))
     except Exception as e:
         logger.error("Failed to fetch symbols: %s", e)
+        symbols = ["BTCUSDT"]
     return symbols
 
 
 def symbol_to_display(symbol: str) -> str:
-    """XBTUSDTM → XBT/USDT, ETHUSDTM → ETH/USDT."""
-    base = symbol.replace("USDTM", "").replace("USDM", "")
-    if base == "XBT":
-        base = "BTC"
-    return f"{base}/USDT"
+    """BTCUSDT → BTC/USDT, ETHUSDT → ETH/USDT."""
+    if symbol.endswith("USDT"):
+        base = symbol[:-4]
+        return f"{base}/USDT"
+    return symbol

@@ -1,15 +1,15 @@
-"""Главный оркестратор — мульти-символьный конвейер сигналов.
+"""Главный оркестратор — мульти-символьный конвейер сигналов (Bybit).
 
 Архитектура:
-  1. Через REST получаем ВСЕ активные фьючерсные пары KuCoin
-  2. Подписываемся на snapshot (ликвидации) по всем символам
-  3. LiquidationCollector собирает ликвидации в пакетное окно (batch)
-  4. По окончании окна выбирает КРУПНЕЙШУЮ ликвидацию
+  1. Через REST получаем ВСЕ активные linear пары Bybit
+  2. Подписываемся на allLiquidation для всех символов
+  3. Агрегируем ликвидации per-symbol за окно (как в Node.js)
+  4. Когда суммарный объём по символу превышает порог — стартуем pipeline
   5. Динамически подписываемся на trades/orderbook для этого символа
   6. Запускаем 4-этапный pipeline подтверждений
 
 Этапы:
-  🟢       Крупнейшая ликвидация из пакета
+  🟢       Агрегированная ликвидация превысила порог
   🟢🟢     Боллинджер подтверждает
   🟢🟢🟢   Скопление ордеров подтверждает
   🟢🟢🟢🟢 Перевес объёмов подтверждён
@@ -19,10 +19,9 @@
 import asyncio
 import time
 import logging
-from dataclasses import dataclass, field
 
 from config import Config
-from kucoin_ws import KuCoinFuturesWS
+from bybit_ws import BybitWS
 from indicators import BollingerBands
 from order_cluster import OrderClusterDetector
 from dominance import DominanceShiftDetector
@@ -40,66 +39,72 @@ SIGNAL_WINDOW = 120  # если все 4 этапа не собрались за
 
 
 # ═════════════════════════════════════════════════════════════════════
-# Пакетный сборщик ликвидаций
+# Агрегатор ликвидаций (по аналогии с Node.js кодом)
 # ═════════════════════════════════════════════════════════════════════
 
-@dataclass
-class LiqEvent:
-    symbol: str
-    side: str       # 'buy' | 'sell'
-    size_usd: float
-    price: float
-    ts: float
+class LiquidationAggregator:
+    """Агрегирует ликвидации per-symbol за скользящее окно.
 
+    Логика из Node.js кода:
+      - Каждая ликвидация >= min_size попадает в аккумулятор
+      - По таймеру (aggregation_interval) проверяем суммы
+      - Если long_sum >= long_threshold → LONG SPIKE
+      - Если short_sum >= short_threshold → SHORT SPIKE
+      - После проверки обнуляем аккумулятор
+    """
 
-class LiquidationCollector:
-    """Собирает ликвидации в пакетное окно, затем выбирает крупнейшую."""
+    def __init__(self):
+        self.min_size = Config.BYBIT_MIN_SIZE
+        self.long_threshold = Config.BYBIT_LONG_THRESHOLD
+        self.short_threshold = Config.BYBIT_SHORT_THRESHOLD
+        # {symbol: {"long": float, "short": float}}
+        self._agg: dict[str, dict[str, float]] = {}
+        self._sent_signals: set[str] = set()
 
-    def __init__(self, window: float = None):
-        self.window = window or Config.LIQUIDATION_BATCH_WINDOW
-        self._batch: list[LiqEvent] = []
-        self._batch_start: float = 0
+    def add(self, symbol: str, side: str, size_usd: float):
+        """Добавить ликвидацию. side = 'Buy' | 'Sell'."""
+        if size_usd < self.min_size:
+            return
+        if symbol not in self._agg:
+            self._agg[symbol] = {"long": 0.0, "short": 0.0}
+        if side == "Buy":
+            self._agg[symbol]["long"] += size_usd
+        else:
+            self._agg[symbol]["short"] += size_usd
 
-    def add(self, event: LiqEvent):
-        now = time.time()
-        if not self._batch:
-            self._batch_start = now
-        self._batch.append(event)
+    def flush(self) -> list[dict]:
+        """Проверить пороги и вернуть список сработавших сигналов.
 
-    def is_ready(self) -> bool:
-        """Пакет готов, если окно истекло и есть события."""
-        if not self._batch:
-            return False
-        return (time.time() - self._batch_start) >= self.window
+        Возвращает: [{"symbol": str, "side": "Buy"|"Sell", "amount": float}, ...]
+        """
+        signals = []
+        for symbol, data in self._agg.items():
+            long_amt = data["long"]
+            short_amt = data["short"]
 
-    def flush(self) -> LiqEvent | None:
-        """Вернуть крупнейшую ликвидацию из пакета и очистить."""
-        if not self._batch:
-            return None
-        # Сортируем по size_usd (убывающий)
-        best = max(self._batch, key=lambda e: e.size_usd)
-        count = len(self._batch)
-        total_usd = sum(e.size_usd for e in self._batch)
-        logger.info(
-            "Batch flush: %d liquidations, total $%.0f → BEST: %s %s $%.0f",
-            count, total_usd, best.symbol, best.side, best.size_usd,
-        )
-        self._batch.clear()
-        self._batch_start = 0
-        return best
+            long_key = f"{symbol}-LONG-{int(long_amt)}"
+            short_key = f"{symbol}-SHORT-{int(short_amt)}"
 
-    @property
-    def batch_count(self) -> int:
-        return len(self._batch)
+            if long_amt >= self.long_threshold and long_key not in self._sent_signals:
+                self._sent_signals.add(long_key)
+                signals.append({"symbol": symbol, "side": "Buy", "amount": long_amt})
+                logger.info("LONG spike: %s $%.0f", symbol, long_amt)
 
-    @property
-    def batch_summary(self) -> str:
-        """Краткая сводка текущего пакета."""
-        if not self._batch:
-            return "пусто"
-        symbols = set(e.symbol for e in self._batch)
-        total = sum(e.size_usd for e in self._batch)
-        return f"{len(self._batch)} liqs | {len(symbols)} symbols | ${total:,.0f}"
+            if short_amt >= self.short_threshold and short_key not in self._sent_signals:
+                self._sent_signals.add(short_key)
+                signals.append({"symbol": symbol, "side": "Sell", "amount": short_amt})
+                logger.info("SHORT spike: %s $%.0f", symbol, short_amt)
+
+            # Обнулить после проверки
+            data["long"] = 0.0
+            data["short"] = 0.0
+
+        return signals
+
+    def clear_cache(self):
+        """Очистить кеш отправленных сигналов (раз в 10 мин)."""
+        self._sent_signals.clear()
+        logger.info("Signal cache cleared")
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -119,7 +124,7 @@ class SignalPipeline:
         self.stage = 0
         self.side: str | None = None  # 'buy' | 'sell'
         self.start_time: float = 0
-        self.liq_size: float = 0
+        self.liq_amount: float = 0
         self.last_price: float = 0
         self.symbol = ""
         self.display = ""
@@ -131,12 +136,12 @@ class SignalPipeline:
     def active(self) -> bool:
         return self.stage > 0 and not self._expired()
 
-    # ── Этап 1: Ликвидация (крупнейшая из пакета) ────────────────────
+    # ── Этап 1: Ликвидация (агрегированный спайк) ────────────────────
 
-    async def on_liquidation(self, symbol: str, side: str,
-                              size_usd: float, price: float,
-                              batch_count: int, batch_summary: str):
-        signal_side = "buy" if side == "sell" else "sell"
+    async def on_liquidation(self, symbol: str, side: str, amount: float):
+        # Buy-ликвидация (лонги ликвидированы) → ожидаем разворот вверх (buy)
+        # Sell-ликвидация (шорты ликвидированы) → ожидаем разворот вниз (sell)
+        signal_side = "buy" if side == "Buy" else "sell"
 
         self.reset()
         self.stage = 1
@@ -144,13 +149,12 @@ class SignalPipeline:
         self.display = symbol_to_display(symbol)
         self.side = signal_side
         self.start_time = time.time()
-        self.liq_size = size_usd
-        self.last_price = price
+        self.liq_amount = amount
 
         await self.notifier.stage_1_liquidation(
-            self.display, side, size_usd, batch_count, batch_summary)
-        logger.info("Stage 1 ✓  %s  side=%s  liq=$%.0f  (batch %d)",
-                     symbol, self.side, size_usd, batch_count)
+            self.display, side.lower(), amount)
+        logger.info("Stage 1 ✓  %s  signal_side=%s  liq=$%.0f",
+                     symbol, self.side, amount)
 
     # ── Этап 2: Боллинджер ───────────────────────────────────────────
 
@@ -221,14 +225,14 @@ class TradingBot:
         self.symbols = symbols
         self.notifier = TelegramNotifier()
         self.pipeline = SignalPipeline(self.notifier)
-        self.collector = LiquidationCollector()
+        self.aggregator = LiquidationAggregator()
 
         # Индикаторы (создаются заново при фокусе на новый символ)
         self.bb = BollingerBands()
         self.cluster = OrderClusterDetector()
         self.dominance = DominanceShiftDetector()
 
-        self.ws = KuCoinFuturesWS(symbols)
+        self.ws = BybitWS(symbols)
         self._last_price: float = 0
 
         # Регистрируем callback-и
@@ -245,11 +249,12 @@ class TradingBot:
     # ── Обработка сделок (для целевого символа) ──────────────────────
 
     async def _handle_trade(self, data: dict):
+        """Bybit publicTrade: {s, S: 'Buy'|'Sell', v: size, p: price, T: ts_ms}."""
         try:
-            price = float(data.get("price", 0))
-            size = float(data.get("size", 0))
-            side = data.get("side", "buy").lower()
-            ts = float(data.get("ts", time.time() * 1e9)) / 1e9
+            price = float(data.get("p", 0))
+            size = float(data.get("v", 0))
+            side = data.get("S", "Buy").lower()  # 'buy' | 'sell'
+            ts = float(data.get("T", time.time() * 1000)) / 1000
         except (ValueError, TypeError):
             return
 
@@ -267,7 +272,7 @@ class TradingBot:
                     bb_side, price, bands["lower"], bands["upper"])
 
         # ── Перевес ───────────────────────────────────────────────────
-        self.dominance.add_trade(ts, side, size)
+        self.dominance.add_trade(ts, side, size * price)
         dom = self.dominance.check_signal(side_hint=self.pipeline.side)
         if dom:
             await self.pipeline.on_dominance_shift(
@@ -276,9 +281,10 @@ class TradingBot:
     # ── Обработка стакана (для целевого символа) ─────────────────────
 
     async def _handle_orderbook(self, data: dict):
+        """Bybit orderbook: {s, b: [[price, size]], a: [[price, size]]}."""
         try:
-            bids = [[float(p), float(s)] for p, s in data.get("bids", [])]
-            asks = [[float(p), float(s)] for p, s in data.get("asks", [])]
+            bids = [[float(p), float(s)] for p, s in data.get("b", [])]
+            asks = [[float(p), float(s)] for p, s in data.get("a", [])]
         except (ValueError, TypeError):
             return
 
@@ -291,101 +297,94 @@ class TradingBot:
     # ── Обработка ликвидаций (все символы) ───────────────────────────
 
     async def _handle_liquidation(self, data: dict):
+        """Bybit allLiquidation: {s: symbol, S: 'Buy'|'Sell', v: size_str, p: price_str}."""
         try:
-            inner = data if isinstance(data, dict) else {}
-            symbol = inner.get("_symbol", "")
-            price = float(inner.get("price", inner.get("markPrice", 0)))
-            size = float(inner.get("size", inner.get("qty", 0)))
-            side = inner.get("side", "").lower()
+            symbol = data.get("s", "")
+            side = data.get("S", "")  # 'Buy' | 'Sell'
+            size = float(data.get("v", 0))
+            price = float(data.get("p", 0))
 
-            if price <= 0 or side not in ("buy", "sell"):
+            if not symbol or not side or price <= 0:
                 return
 
-            size_usd = size * price
-
-            if size_usd >= Config.LIQUIDATION_THRESHOLD_USD:
-                event = LiqEvent(
-                    symbol=symbol, side=side,
-                    size_usd=size_usd, price=price, ts=time.time(),
-                )
-                self.collector.add(event)
-                logger.info("Liq queued: %s %s $%.0f @ %.2f [batch: %s]",
-                            symbol, side, size_usd, price,
-                            self.collector.batch_summary)
-
-                # Проверяем, готов ли пакет
-                await self._try_flush_batch()
+            size_usd = size  # Bybit v уже в USD для linear
+            self.aggregator.add(symbol, side, size_usd)
 
         except (ValueError, TypeError, KeyError) as e:
             logger.debug("Liquidation parse skip: %s", e)
 
-    async def _try_flush_batch(self):
-        """Если пакетное окно истекло — выбрать лучшую ликвидацию и запустить pipeline."""
-        if not self.collector.is_ready():
-            return
+    # ── Периодический flush агрегатора ────────────────────────────────
 
-        # Не прерываем активный pipeline
-        if self.pipeline.active:
-            logger.debug("Pipeline active, skipping batch flush")
-            self.collector.flush()  # сбрасываем чтобы не копить
-            return
-
-        batch_count = self.collector.batch_count
-        batch_summary = self.collector.batch_summary
-        best = self.collector.flush()
-        if not best:
-            return
-
-        # Переключаемся на символ с крупнейшей ликвидацией
-        logger.info("🎯 Focusing on %s (biggest liq $%.0f)",
-                     best.symbol, best.size_usd)
-        self._reset_indicators()
-        await self.ws.focus_symbol(best.symbol)
-
-        # Запускаем pipeline — этап 1
-        await self.pipeline.on_liquidation(
-            best.symbol, best.side, best.size_usd, best.price,
-            batch_count, batch_summary,
-        )
-
-    # ── Периодическая проверка пакета ────────────────────────────────
-
-    async def _batch_checker(self):
-        """Фоновая задача: проверяет готовность пакета каждую секунду."""
+    async def _aggregation_loop(self):
+        """Каждые N секунд проверяем агрегированные ликвидации."""
+        interval = Config.BYBIT_AGGREGATION_INTERVAL
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(interval)
             try:
-                await self._try_flush_batch()
+                signals = self.aggregator.flush()
+                if not signals:
+                    continue
+
+                # Выбираем самый крупный сигнал
+                best = max(signals, key=lambda s: s["amount"])
+
+                # Не прерываем активный pipeline
+                if self.pipeline.active:
+                    logger.debug("Pipeline active, skipping aggregation signal")
+                    continue
+
+                logger.info("🎯 Biggest liquidation spike: %s %s $%.0f",
+                             best["symbol"], best["side"], best["amount"])
+
+                # Сброс индикаторов и фокус на новый символ
+                self._reset_indicators()
+                await self.ws.focus_symbol(best["symbol"])
+
+                # Запускаем pipeline — этап 1
+                await self.pipeline.on_liquidation(
+                    best["symbol"], best["side"], best["amount"])
+
             except Exception as e:
-                logger.error("Batch checker error: %s", e)
+                logger.error("Aggregation loop error: %s", e)
+
+    async def _cache_cleaner(self):
+        """Раз в 10 минут очищаем кеш отправленных сигналов."""
+        while True:
+            await asyncio.sleep(10 * 60)
+            self.aggregator.clear_cache()
 
     # ── Запуск ────────────────────────────────────────────────────────
 
     async def run(self):
-        logger.info("=== KuCoin Liquidation Bot started ===")
-        logger.info("Monitoring %d symbols | BB(%d, %.1f) | Liq threshold: $%.0f | Batch window: %ds",
+        logger.info("=== Bybit Liquidation Bot started ===")
+        logger.info("Monitoring %d symbols | BB(%d, %.1f) | "
+                     "LONG threshold: $%.0f | SHORT threshold: $%.0f | "
+                     "Aggregation: %ds | Min size: $%.0f",
                      len(self.symbols), Config.BOLLINGER_PERIOD,
-                     Config.BOLLINGER_STD, Config.LIQUIDATION_THRESHOLD_USD,
-                     Config.LIQUIDATION_BATCH_WINDOW)
+                     Config.BOLLINGER_STD, Config.BYBIT_LONG_THRESHOLD,
+                     Config.BYBIT_SHORT_THRESHOLD,
+                     Config.BYBIT_AGGREGATION_INTERVAL, Config.BYBIT_MIN_SIZE)
 
         await self.notifier.send(
-            f"🤖 <b>Бот запущен</b>\n"
+            f"📡 <b>Liquidation Bot запущен</b>\n"
+            f"Биржа: Bybit (все символы)\n"
             f"Мониторинг: <b>{len(self.symbols)} пар</b>\n"
-            f"Порог ликвидации: ${Config.LIQUIDATION_THRESHOLD_USD:,.0f}\n"
-            f"Пакетное окно: {Config.LIQUIDATION_BATCH_WINDOW}с\n"
+            f"LONG порог: ${Config.BYBIT_LONG_THRESHOLD:,.0f}\n"
+            f"SHORT порог: ${Config.BYBIT_SHORT_THRESHOLD:,.0f}\n"
+            f"Агрегация: {Config.BYBIT_AGGREGATION_INTERVAL}с\n"
             f"BB({Config.BOLLINGER_PERIOD}, {Config.BOLLINGER_STD})"
         )
 
-        # Запускаем WS и batch-checker параллельно
+        # Запускаем WS, aggregation loop и cache cleaner параллельно
         await asyncio.gather(
             self.ws.run(),
-            self._batch_checker(),
+            self._aggregation_loop(),
+            self._cache_cleaner(),
         )
 
 
 async def main():
-    # Получаем все активные фьючерсные символы
-    logger.info("Fetching active KuCoin Futures symbols...")
+    logger.info("Fetching active Bybit linear symbols...")
     symbols = await fetch_all_symbols()
     if not symbols:
         logger.error("No symbols found! Check internet connection.")
