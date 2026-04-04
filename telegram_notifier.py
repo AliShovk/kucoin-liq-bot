@@ -27,13 +27,16 @@ class TelegramNotifier:
 
     # ── Этапы сигнала ───────────────────────────────────────────────
 
-    async def stage_1_liquidation(self, symbol: str, side: str, size_usd: float):
-        """🟢  — обнаружена крупная ликвидация."""
+    async def stage_1_liquidation(self, symbol: str, side: str, size_usd: float,
+                                   batch_count: int = 1, batch_summary: str = ""):
+        """🟢  — обнаружена крупнейшая ликвидация из пакета."""
         direction = "LONG ликвидация 📉" if side == "sell" else "SHORT ликвидация 📈"
+        batch_info = f"\n📦 Пакет: {batch_summary}" if batch_summary else ""
         text = (
             f"🟢 <b>Ликвидация обнаружена</b>\n"
             f"{symbol} | {direction}\n"
-            f"Объём: <b>${size_usd:,.0f}</b>"
+            f"Объём: <b>${size_usd:,.0f}</b> (крупнейшая из {batch_count})"
+            f"{batch_info}"
         )
         await self.send(text)
 

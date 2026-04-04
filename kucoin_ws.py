@@ -1,9 +1,8 @@
-"""KuCoin Futures WebSocket клиент.
+"""KuCoin Futures WebSocket клиент — мульти-символ.
 
-Подписывается на:
-  - /contractMarket/execution:{symbol}    — лента сделок (trades)
-  - /contractMarket/level2:{symbol}       — стакан ордеров (orderbook L2)
-  - /contract/announcement                — ликвидации (forcedOrder)
+Подписывается на snapshot ДЛЯ ВСЕХ символов (ликвидации).
+Динамически подписывается на trades/orderbook для целевого символа
+после того, как пакетный анализатор выбрал самую крупную ликвидацию.
 
 Для получения WS-токена используется публичный REST endpoint.
 """
@@ -33,18 +32,26 @@ async def _get_ws_token() -> tuple[str, str]:
             return endpoint, token
 
 
-class KuCoinFuturesWS:
-    """Асинхронный WS-клиент для KuCoin Futures."""
+def _extract_symbol(topic: str) -> str:
+    """'/contractMarket/execution:XBTUSDTM' → 'XBTUSDTM'."""
+    if ":" in topic:
+        return topic.split(":")[-1]
+    return ""
 
-    def __init__(self):
-        self.symbol = Config.KUCOIN_FUTURES_SYMBOL  # e.g. BTC-USDT
+
+class KuCoinFuturesWS:
+    """Асинхронный WS-клиент для KuCoin Futures — мульти-символ."""
+
+    def __init__(self, symbols: list[str]):
+        self.symbols = symbols  # ['XBTUSDTM', 'ETHUSDTM', ...]
         self._on_trade: Callable | None = None
         self._on_orderbook: Callable | None = None
         self._on_liquidation: Callable | None = None
         self._ws = None
         self._session: aiohttp.ClientSession | None = None
         self._running = False
-        self._ping_interval = 18  # KuCoin требует ping каждые 20с
+        self._ping_interval = 18
+        self._active_target: str | None = None  # символ с активной подпиской на trades/ob
 
     # ── Регистрация callback-ов ──────────────────────────────────────
 
@@ -56,6 +63,42 @@ class KuCoinFuturesWS:
 
     def on_liquidation(self, fn: Callable[..., Awaitable]):
         self._on_liquidation = fn
+
+    # ── Динамическая подписка на целевой символ ──────────────────────
+
+    async def focus_symbol(self, symbol: str):
+        """Подписаться на trades + orderbook для конкретного символа.
+        Автоматически отписывается от предыдущего целевого символа.
+        """
+        if self._ws is None or self._ws.closed:
+            return
+
+        # Отписаться от предыдущего
+        if self._active_target and self._active_target != symbol:
+            await self._unsubscribe(
+                f"/contractMarket/execution:{self._active_target}")
+            await self._unsubscribe(
+                f"/contractMarket/level2Depth50:{self._active_target}")
+            logger.info("Unfocused %s", self._active_target)
+
+        if self._active_target == symbol:
+            return  # уже подписаны
+
+        # Подписаться на новый
+        await self._subscribe(f"/contractMarket/execution:{symbol}")
+        await self._subscribe(f"/contractMarket/level2Depth50:{symbol}")
+        self._active_target = symbol
+        logger.info("Focused → %s (trades + orderbook)", symbol)
+
+    async def unfocus(self):
+        """Отписаться от текущего целевого символа."""
+        if self._active_target and self._ws and not self._ws.closed:
+            await self._unsubscribe(
+                f"/contractMarket/execution:{self._active_target}")
+            await self._unsubscribe(
+                f"/contractMarket/level2Depth50:{self._active_target}")
+            logger.info("Unfocused %s", self._active_target)
+            self._active_target = None
 
     # ── Основной цикл ────────────────────────────────────────────────
 
@@ -84,11 +127,16 @@ class KuCoinFuturesWS:
         self._ws = await self._session.ws_connect(url, heartbeat=self._ping_interval)
         logger.info("WS connected to %s", endpoint)
 
-        # Подписки
-        await self._subscribe(f"/contractMarket/execution:{self.symbol}", False)
-        await self._subscribe(f"/contractMarket/level2Depth50:{self.symbol}", False)
-        # Ликвидации — topic для принудительных ордеров
-        await self._subscribe(f"/contractMarket/snapshot:{self.symbol}", False)
+        # Подписываемся на snapshot (ликвидации) для ВСЕХ символов пачками
+        # KuCoin позволяет до 100 символов через запятую в одном topic
+        batch_size = Config.MAX_WS_SYMBOLS
+        for i in range(0, len(self.symbols), batch_size):
+            batch = self.symbols[i : i + batch_size]
+            topic = "/contractMarket/snapshot:" + ",".join(batch)
+            await self._subscribe(topic)
+            await asyncio.sleep(0.2)  # не спамить подписками
+
+        logger.info("Subscribed to snapshots for %d symbols", len(self.symbols))
 
         async for msg in self._ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
@@ -108,7 +156,18 @@ class KuCoinFuturesWS:
             "response": True,
         }
         await self._ws.send_json(payload)
-        logger.info("Subscribed → %s", topic)
+        logger.debug("Subscribed → %s", topic[:80])
+
+    async def _unsubscribe(self, topic: str, private: bool = False):
+        payload = {
+            "id": str(int(time.time() * 1000)),
+            "type": "unsubscribe",
+            "topic": topic,
+            "privateChannel": private,
+            "response": True,
+        }
+        await self._ws.send_json(payload)
+        logger.debug("Unsubscribed → %s", topic[:80])
 
     async def _dispatch(self, raw: str):
         try:
@@ -117,20 +176,24 @@ class KuCoinFuturesWS:
             return
 
         msg_type = data.get("type")
-        if msg_type == "pong" or msg_type == "welcome" or msg_type == "ack":
+        if msg_type in ("pong", "welcome", "ack"):
             return
 
         topic: str = data.get("topic", "")
         payload = data.get("data", {})
+        symbol = _extract_symbol(data.get("subject", topic))
 
         # ── Сделки (execution) ───────────────────────────────────────
         if "execution" in topic and self._on_trade:
+            payload["_symbol"] = symbol
             await self._on_trade(payload)
 
         # ── Стакан L2 depth ──────────────────────────────────────────
         elif "level2Depth50" in topic and self._on_orderbook:
+            payload["_symbol"] = symbol
             await self._on_orderbook(payload)
 
-        # ── Snapshot — содержит данные о ликвидациях / маркировке ─────
+        # ── Snapshot — ликвидации для всех символов ──────────────────
         elif "snapshot" in topic and self._on_liquidation:
+            payload["_symbol"] = symbol
             await self._on_liquidation(payload)

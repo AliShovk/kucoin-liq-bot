@@ -14,9 +14,11 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # Торговая пара
-    SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
-    KUCOIN_FUTURES_SYMBOL = SYMBOL.replace("/", "-")  # BTC-USDT для WS
+    # Мульти-символ: парсим ВСЕ фьючерсные пары
+    # Пакетное окно сбора ликвидаций (секунды)
+    LIQUIDATION_BATCH_WINDOW = int(os.getenv("LIQUIDATION_BATCH_WINDOW", "10"))
+    # Макс. кол-во WS-подписок на одно соединение (KuCoin лимит ~100)
+    MAX_WS_SYMBOLS = int(os.getenv("MAX_WS_SYMBOLS", "90"))
 
     # Bollinger Bands
     BOLLINGER_PERIOD = int(os.getenv("BOLLINGER_PERIOD", "20"))
@@ -33,5 +35,3 @@ class Config:
     DOMINANCE_SHIFT_WINDOW = int(os.getenv("DOMINANCE_SHIFT_WINDOW", "30"))
     DOMINANCE_SHIFT_THRESHOLD = float(os.getenv("DOMINANCE_SHIFT_THRESHOLD", "0.6"))
 
-    # Таймфрейм свечей
-    TIMEFRAME = os.getenv("TIMEFRAME", "1m")
