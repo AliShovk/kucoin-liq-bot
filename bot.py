@@ -9,11 +9,12 @@
   6. Запускаем 4-этапный pipeline подтверждений
 
 Этапы:
-  🟢       Агрегированная ликвидация превысила порог
-  🟢🟢     Боллинджер подтверждает
-  🟢🟢🟢   Скопление ордеров подтверждает
-  🟢🟢🟢🟢 Перевес объёмов подтверждён
-  🎆       Финальный сигнал
+  🟢         Агрегированная ликвидация превысила порог
+  🟢🟢       Price Reclaim — цена вернулась через экстремум выноса
+  🟢🟢🟢     Боллинджер подтверждает
+  🟢🟢🟢🟢   Скопление ордеров подтверждает
+  🟢🟢🟢🟢🟢 Перевес объёмов подтверждён
+  🎆         Финальный сигнал
 """
 
 import asyncio
@@ -27,6 +28,7 @@ from order_cluster import OrderClusterDetector
 from dominance import DominanceShiftDetector
 from telegram_notifier import TelegramNotifier
 from symbol_manager import fetch_all_symbols, symbol_to_display
+from kucoin_trader import KuCoinTrader
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger("bot")
 
 # ── Таймаут сигнального окна (секунды) ──────────────────────────────
-SIGNAL_WINDOW = 120  # если все 4 этапа не собрались за 2 мин — сброс
+SIGNAL_WINDOW = 120  # если все 5 этапов не собрались за 2 мин — сброс
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -60,6 +62,7 @@ class LiquidationAggregator:
         # {symbol: {"long": float, "short": float}}
         self._agg: dict[str, dict[str, float]] = {}
         self._sent_signals: set[str] = set()
+        self._events_in_window = 0
 
     def add(self, symbol: str, side: str, size_usd: float):
         """Добавить ликвидацию. side = 'Buy' | 'Sell'."""
@@ -71,6 +74,7 @@ class LiquidationAggregator:
             self._agg[symbol]["long"] += size_usd
         else:
             self._agg[symbol]["short"] += size_usd
+        self._events_in_window += 1
 
     def flush(self) -> list[dict]:
         """Проверить пороги и вернуть список сработавших сигналов.
@@ -78,9 +82,13 @@ class LiquidationAggregator:
         Возвращает: [{"symbol": str, "side": "Buy"|"Sell", "amount": float}, ...]
         """
         signals = []
+        ranked = []
         for symbol, data in self._agg.items():
             long_amt = data["long"]
             short_amt = data["short"]
+            top_amt = max(long_amt, short_amt)
+            if top_amt > 0:
+                ranked.append((symbol, long_amt, short_amt, top_amt))
 
             long_key = f"{symbol}-LONG-{int(long_amt)}"
             short_key = f"{symbol}-SHORT-{int(short_amt)}"
@@ -99,6 +107,21 @@ class LiquidationAggregator:
             data["long"] = 0.0
             data["short"] = 0.0
 
+        ranked.sort(key=lambda item: item[3], reverse=True)
+        if self._events_in_window > 0:
+            top_preview = ", ".join(
+                f"{symbol}:L=${long_amt:,.0f}/S=${short_amt:,.0f}"
+                for symbol, long_amt, short_amt, _ in ranked[:5]
+            )
+            logger.info(
+                "Aggregation flush: events=%d symbols=%d top=%s signals=%d",
+                self._events_in_window,
+                len(ranked),
+                top_preview or "none",
+                len(signals),
+            )
+        self._events_in_window = 0
+
         return signals
 
     def clear_cache(self):
@@ -112,12 +135,14 @@ class LiquidationAggregator:
 # ═════════════════════════════════════════════════════════════════════
 
 class SignalPipeline:
-    """Конечный автомат: собирает 4 подтверждения и выдаёт финальный сигнал."""
+    """Конечный автомат: собирает 5 подтверждений и выдаёт финальный сигнал."""
 
-    def __init__(self, notifier: TelegramNotifier):
+    def __init__(self, notifier: TelegramNotifier, on_final_signal=None):
         self.notifier = notifier
         self.symbol: str = ""
         self.display: str = ""
+        self.reclaim_pct: float = Config.RECLAIM_PCT
+        self._on_final = on_final_signal  # async callback(symbol, side, price)
         self.reset()
 
     def reset(self):
@@ -128,6 +153,8 @@ class SignalPipeline:
         self.last_price: float = 0
         self.symbol = ""
         self.display = ""
+        # Price Reclaim tracking
+        self.extreme_price: float = 0  # экстремум после выноса
 
     def _expired(self) -> bool:
         return self.stage > 0 and (time.time() - self.start_time > SIGNAL_WINDOW)
@@ -156,63 +183,105 @@ class SignalPipeline:
         logger.info("Stage 1 ✓  %s  signal_side=%s  liq=$%.0f",
                      symbol, self.side, amount)
 
-    # ── Этап 2: Боллинджер ───────────────────────────────────────────
+    # ── Этап 2: Price Reclaim ──────────────────────────────────────────
+
+    def update_extreme(self, price: float):
+        """Обновить экстремум выноса (вызывается на каждом тике после Stage 1)."""
+        if self.stage != 1:
+            return
+        if self.side == "buy" and (self.extreme_price == 0 or price < self.extreme_price):
+            self.extreme_price = price
+        elif self.side == "sell" and (self.extreme_price == 0 or price > self.extreme_price):
+            self.extreme_price = price
+
+    def check_reclaim(self, price: float) -> bool:
+        """Проверить, вернулась ли цена через экстремум выноса."""
+        if self.stage != 1 or self.extreme_price == 0:
+            return False
+        if self.side == "buy":
+            return price > self.extreme_price * (1 + self.reclaim_pct)
+        else:
+            return price < self.extreme_price * (1 - self.reclaim_pct)
+
+    async def on_reclaim(self, price: float):
+        if self._expired():
+            self.reset()
+            return
+        if self.stage != 1:
+            return
+
+        self.stage = 2
+        self.last_price = price
+        await self.notifier.stage_2_reclaim(
+            self.display, self.side, self.extreme_price, price)
+        logger.info("Stage 2 ✓  %s RECLAIM extreme=%.2f now=%.2f",
+                     self.symbol, self.extreme_price, price)
+
+    # ── Этап 3: Боллинджер ───────────────────────────────────────────
 
     async def on_bollinger(self, bb_side: str, price: float,
                             lower: float, upper: float):
         if self._expired():
             self.reset()
             return
-        if self.stage != 1:
+        if self.stage != 2:
             return
         if bb_side != self.side:
             return
 
-        self.stage = 2
+        self.stage = 3
         self.last_price = price
-        await self.notifier.stage_2_bollinger(
+        await self.notifier.stage_3_bollinger(
             self.display, bb_side, price, lower, upper)
-        logger.info("Stage 2 ✓  %s BB %s @ %.2f", self.symbol, bb_side, price)
+        logger.info("Stage 3 ✓  %s BB %s @ %.2f", self.symbol, bb_side, price)
 
-    # ── Этап 3: Скопление ордеров ────────────────────────────────────
+    # ── Этап 4: Скопление ордеров ────────────────────────────────────
 
     async def on_order_cluster(self, cluster_side: str, cluster_price: float,
                                 cluster_vol: float):
         if self._expired():
             self.reset()
             return
-        if self.stage != 2:
+        if self.stage != 3:
             return
         if cluster_side != self.side:
             return
 
-        self.stage = 3
-        await self.notifier.stage_3_order_cluster(
+        self.stage = 4
+        await self.notifier.stage_4_order_cluster(
             self.display, cluster_side, cluster_price, cluster_vol)
-        logger.info("Stage 3 ✓  %s cluster %s @ %.2f",
+        logger.info("Stage 4 ✓  %s cluster %s @ %.2f",
                      self.symbol, cluster_side, cluster_price)
 
-    # ── Этап 4: Перевес ──────────────────────────────────────────────
+    # ── Этап 5: Перевес ──────────────────────────────────────────────
 
     async def on_dominance_shift(self, dom_side: str, buy_pct: float,
                                   sell_pct: float, price: float):
         if self._expired():
             self.reset()
             return
-        if self.stage != 3:
+        if self.stage != 4:
             return
         if dom_side != self.side:
             return
 
-        self.stage = 4
+        self.stage = 5
         self.last_price = price
-        await self.notifier.stage_4_dominance_shift(
+        await self.notifier.stage_5_dominance_shift(
             self.display, dom_side, buy_pct, sell_pct)
 
-        # 🎆 Все 4 подтверждения → финальный сигнал
+        # 🎆 Все 5 подтверждений → финальный сигнал
         await self.notifier.stage_final_signal(self.display, self.side, price)
-        logger.info("Stage 4 ✓  FINAL SIGNAL  %s %s @ %.2f 🎆",
+        logger.info("Stage 5 ✓  FINAL SIGNAL  %s %s @ %.2f 🎆",
                      self.symbol, self.side, price)
+
+        # Вызываем callback для исполнения сделки
+        if self._on_final:
+            try:
+                await self._on_final(self.symbol, self.side, price)
+            except Exception as e:
+                logger.error("Final signal callback error: %s", e)
+
         self.reset()
 
 
@@ -224,8 +293,12 @@ class TradingBot:
     def __init__(self, symbols: list[str]):
         self.symbols = symbols
         self.notifier = TelegramNotifier()
-        self.pipeline = SignalPipeline(self.notifier)
+        self.trade_notifier = TelegramNotifier(use_trade_channel=True)
+        self.trader = KuCoinTrader()
+        self.pipeline = SignalPipeline(
+            self.notifier, on_final_signal=self._execute_trade)
         self.aggregator = LiquidationAggregator()
+        self._liq_debug_seen = 0
 
         # Индикаторы (создаются заново при фокусе на новый символ)
         self.bb = BollingerBands()
@@ -246,6 +319,53 @@ class TradingBot:
         self.cluster = OrderClusterDetector()
         self.dominance = DominanceShiftDetector()
 
+    # ── Исполнение сделки на KuCoin Futures ────────────────────────
+
+    async def _execute_trade(self, symbol: str, side: str, price: float):
+        """Callback из pipeline: финальный сигнал → открытие позиции."""
+        result = await self.trader.execute_signal(symbol, side, price)
+        if result:
+            await self.trade_notifier.trade_opened(
+                result["symbol"],
+                side,
+                result["size_usdt"],
+                self.trader.leverage,
+                result["entry_price"],
+                result["tp_price"],
+                result["sl_price"],
+            )
+        elif self.trader.enabled:
+            await self.trade_notifier.trade_open_failed(
+                symbol,
+                side,
+                price,
+                "order rejected / API error",
+            )
+
+    async def _trade_monitor_loop(self):
+        while True:
+            await asyncio.sleep(Config.TRADE_MONITOR_INTERVAL)
+            try:
+                events = await self.trader.poll_updates()
+                for event in events:
+                    if event["type"] == "trade_closed":
+                        await self.trade_notifier.trade_closed(
+                            event["symbol"],
+                            event["side"],
+                            event["exit_price"],
+                            event["pnl_pct"],
+                            event["reason"],
+                            event["summary"],
+                        )
+                    elif event["type"] == "size_scaled":
+                        await self.trade_notifier.trade_size_scaled(
+                            event["old_size"],
+                            event["new_size"],
+                            event["winrate"],
+                        )
+            except Exception as e:
+                logger.error("Trade monitor loop error: %s", e)
+
     # ── Обработка сделок (для целевого символа) ──────────────────────
 
     async def _handle_trade(self, data: dict):
@@ -262,6 +382,12 @@ class TradingBot:
             return
 
         self._last_price = price
+
+        # ── Price Reclaim (Stage 1 → 2) ─────────────────────────────
+        if self.pipeline.stage == 1:
+            self.pipeline.update_extreme(price)
+            if self.pipeline.check_reclaim(price):
+                await self.pipeline.on_reclaim(price)
 
         # ── Боллинджер ────────────────────────────────────────────────
         bb_side = self.bb.check_signal(price)
@@ -307,7 +433,18 @@ class TradingBot:
             if not symbol or not side or price <= 0:
                 return
 
-            size_usd = size  # Bybit v уже в USD для linear
+            size_usd = size * price  # v = кол-во монет, переводим в USD
+            if self._liq_debug_seen < 10:
+                logger.info(
+                    "Liq sample %d: symbol=%s side=%s v=%s p=%s usd=%.0f",
+                    self._liq_debug_seen + 1,
+                    symbol,
+                    side,
+                    data.get("v"),
+                    data.get("p"),
+                    size_usd,
+                )
+                self._liq_debug_seen += 1
             self.aggregator.add(symbol, side, size_usd)
 
         except (ValueError, TypeError, KeyError) as e:
@@ -365,6 +502,14 @@ class TradingBot:
                      Config.BYBIT_SHORT_THRESHOLD,
                      Config.BYBIT_AGGREGATION_INTERVAL, Config.BYBIT_MIN_SIZE)
 
+        trade_status = (
+            f"✅ Автоторговля: KuCoin Futures\n"
+            f"Плечо: {Config.TRADE_LEVERAGE}x | "
+            f"Размер: ${self.trader.tracker.get_size():.2f}\n"
+            f"TP: {Config.TRADE_TP_PCT}% | SL: {Config.TRADE_SL_PCT}%\n"
+            f"📊 {self.trader.trade_summary_text()}"
+        ) if Config.AUTOTRADE_ENABLED else "❌ Автоторговля выключена (только сигналы)"
+
         await self.notifier.send(
             f"📡 <b>Liquidation Bot запущен</b>\n"
             f"Биржа: Bybit (все символы)\n"
@@ -372,7 +517,9 @@ class TradingBot:
             f"LONG порог: ${Config.BYBIT_LONG_THRESHOLD:,.0f}\n"
             f"SHORT порог: ${Config.BYBIT_SHORT_THRESHOLD:,.0f}\n"
             f"Агрегация: {Config.BYBIT_AGGREGATION_INTERVAL}с\n"
-            f"BB({Config.BOLLINGER_PERIOD}, {Config.BOLLINGER_STD})"
+            f"BB({Config.BOLLINGER_PERIOD}, {Config.BOLLINGER_STD})\n"
+            f"───────────────\n"
+            f"{trade_status}"
         )
 
         # Запускаем WS, aggregation loop и cache cleaner параллельно
@@ -380,6 +527,7 @@ class TradingBot:
             self.ws.run(),
             self._aggregation_loop(),
             self._cache_cleaner(),
+            self._trade_monitor_loop(),
         )
 
 
@@ -398,6 +546,7 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Shutting down…")
         await bot.ws.stop()
+        await bot.trader.close()
 
 
 if __name__ == "__main__":

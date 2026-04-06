@@ -35,6 +35,14 @@ class BybitWS:
         self._active_target: str | None = None
         self._ping_interval = 20
 
+    async def _cleanup_connection(self):
+        if self._ws and not self._ws.closed:
+            await self._ws.close()
+        self._ws = None
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = None
+
     # ── Регистрация callback-ов ──────────────────────────────────────
 
     def on_liquidation(self, fn: Callable[..., Awaitable]):
@@ -89,16 +97,15 @@ class BybitWS:
                 await self._connect_and_listen()
             except Exception as e:
                 logger.error("WS error: %s — reconnecting in 5s", e)
+                await self._cleanup_connection()
                 await asyncio.sleep(5)
 
     async def stop(self):
         self._running = False
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-        if self._session and not self._session.closed:
-            await self._session.close()
+        await self._cleanup_connection()
 
     async def _connect_and_listen(self):
+        await self._cleanup_connection()
         self._session = aiohttp.ClientSession()
         self._ws = await self._session.ws_connect(
             BYBIT_WS_URL, heartbeat=self._ping_interval)
@@ -130,8 +137,7 @@ class BybitWS:
                     break
         finally:
             ping_task.cancel()
-            if self._session and not self._session.closed:
-                await self._session.close()
+            await self._cleanup_connection()
 
     async def _ping_loop(self):
         """Bybit требует ping каждые 20с для поддержки соединения."""
