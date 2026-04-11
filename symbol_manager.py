@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info?category=linear"
 
-EXCLUDED_SYMBOLS = {"BANANAS31USDT", "PUMPFUNUSDT"}
+EXCLUDED_SYMBOLS = {"BANANAS31USDT", "PUMPFUNUSDT", "BTCUSDT", "ETHUSDT"}
 
 
 async def fetch_all_symbols() -> list[str]:
