@@ -27,7 +27,7 @@ async def fetch_all_symbols() -> list[str]:
         logger.info("Fetched %d active Bybit linear symbols", len(symbols))
     except Exception as e:
         logger.error("Failed to fetch symbols: %s", e)
-        symbols = ["BTCUSDT"]
+        symbols = ["XRPUSDT"]
     return symbols
 
 

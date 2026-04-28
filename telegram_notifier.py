@@ -66,10 +66,15 @@ class TelegramNotifier:
     async def stage_4_order_cluster(self, symbol: str, side: str,
                                      cluster_price: float, cluster_vol: float):
         wall = "BID-стена (покупатели)" if side == "buy" else "ASK-стена (продавцы)"
+        stop_price = (
+            cluster_price * (1 - Config.STOP_BUFFER_PCT) if side == "buy"
+            else cluster_price * (1 + Config.STOP_BUFFER_PCT)
+        )
         text = (
             f"🟢🟢🟢🟢 <b>Скопление ордеров</b>\n"
             f"{symbol} | {wall}\n"
-            f"Цена кластера: {cluster_price:.2f}  |  Объём: {cluster_vol:,.2f}"
+            f"Цена кластера: {cluster_price:.2f}  |  Объём: {cluster_vol:,.2f}\n"
+            f"Stop level: {stop_price:.2f}"
         )
         await self.send(text)
 
@@ -85,12 +90,21 @@ class TelegramNotifier:
         )
         await self.send(text)
 
-    async def stage_final_signal(self, symbol: str, side: str, price: float):
+    async def stage_final_signal(self, symbol: str, side: str, price: float,
+                                  cluster_price: float = 0):
         action = "🚀 ПОКУПКА (LONG)" if side == "buy" else "🔻 ПРОДАЖА (SHORT)"
+        stop_hint = ""
+        if cluster_price > 0:
+            stop_price = (
+                cluster_price * (1 - Config.STOP_BUFFER_PCT) if side == "buy"
+                else cluster_price * (1 + Config.STOP_BUFFER_PCT)
+            )
+            stop_hint = f"\nStop: {stop_price:.2f} | Cluster: {cluster_price:.2f}"
         text = (
             f"🎆🎆🎆 <b>СИГНАЛ: {action}</b> 🎆🎆🎆\n"
             f"{symbol} @ {price:.2f}\n"
             f"Все 5 подтверждений пройдены ✅"
+            f"{stop_hint}"
         )
         await self.send(text)
 

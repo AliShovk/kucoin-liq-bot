@@ -18,8 +18,10 @@
 """
 
 import asyncio
+import csv
 import time
 import logging
+from pathlib import Path
 
 from config import Config
 from bybit_ws import BybitWS
@@ -155,6 +157,7 @@ class SignalPipeline:
         self.display = ""
         # Price Reclaim tracking
         self.extreme_price: float = 0  # экстремум после выноса
+        self.cluster_price: float = 0
 
     def _expired(self) -> bool:
         return self.stage > 0 and (time.time() - self.start_time > SIGNAL_WINDOW)
@@ -248,6 +251,7 @@ class SignalPipeline:
             return
 
         self.stage = 4
+        self.cluster_price = cluster_price
         await self.notifier.stage_4_order_cluster(
             self.display, cluster_side, cluster_price, cluster_vol)
         logger.info("Stage 4 ✓  %s cluster %s @ %.2f",
@@ -271,14 +275,15 @@ class SignalPipeline:
             self.display, dom_side, buy_pct, sell_pct)
 
         # 🎆 Все 5 подтверждений → финальный сигнал
-        await self.notifier.stage_final_signal(self.display, self.side, price)
+        await self.notifier.stage_final_signal(
+            self.display, self.side, price, self.cluster_price)
         logger.info("Stage 5 ✓  FINAL SIGNAL  %s %s @ %.2f 🎆",
                      self.symbol, self.side, price)
 
         # Вызываем callback для исполнения сделки
         if self._on_final:
             try:
-                await self._on_final(self.symbol, self.side, price)
+                await self._on_final(self, self.symbol, self.side, price)
             except Exception as e:
                 logger.error("Final signal callback error: %s", e)
 
@@ -307,11 +312,60 @@ class TradingBot:
 
         self.ws = BybitWS(symbols)
         self._last_price: float = 0
+        self._cooldowns: dict[str, float] = {}
+        self.signal_log_path = Path(Config.SIGNAL_LOG_CSV)
 
         # Регистрируем callback-и
         self.ws.on_trade(self._handle_trade)
         self.ws.on_orderbook(self._handle_orderbook)
         self.ws.on_liquidation(self._handle_liquidation)
+
+    def _stop_price(self, side: str, cluster_price: float) -> float:
+        if cluster_price <= 0:
+            return 0.0
+        if side == "buy":
+            return cluster_price * (1 - Config.STOP_BUFFER_PCT)
+        return cluster_price * (1 + Config.STOP_BUFFER_PCT)
+
+    def _is_on_cooldown(self, symbol: str) -> bool:
+        expires_at = self._cooldowns.get(symbol, 0)
+        return expires_at > time.time()
+
+    def _activate_cooldown(self, symbol: str):
+        self._cooldowns[symbol] = time.time() + Config.SYMBOL_COOLDOWN_SECONDS
+
+    def _log_signal(self, symbol: str, side: str, entry_price: float, pipeline: SignalPipeline):
+        stop_price = self._stop_price(side, pipeline.cluster_price)
+        self.signal_log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_exists = self.signal_log_path.exists()
+        with self.signal_log_path.open("a", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(
+                fp,
+                fieldnames=[
+                    "timestamp",
+                    "symbol",
+                    "side",
+                    "liq_amount_usd",
+                    "entry_price",
+                    "extreme_price",
+                    "cluster_price",
+                    "stop_price",
+                ],
+            )
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(
+                {
+                    "timestamp": int(time.time()),
+                    "symbol": symbol,
+                    "side": side,
+                    "liq_amount_usd": f"{pipeline.liq_amount:.2f}",
+                    "entry_price": f"{entry_price:.2f}",
+                    "extreme_price": f"{pipeline.extreme_price:.2f}",
+                    "cluster_price": f"{pipeline.cluster_price:.2f}",
+                    "stop_price": f"{stop_price:.2f}",
+                }
+            )
 
     def _reset_indicators(self):
         """Сбросить индикаторы при переключении символа."""
@@ -321,8 +375,10 @@ class TradingBot:
 
     # ── Исполнение сделки на KuCoin Futures ────────────────────────
 
-    async def _execute_trade(self, symbol: str, side: str, price: float):
+    async def _execute_trade(self, pipeline: SignalPipeline, symbol: str, side: str, price: float):
         """Callback из pipeline: финальный сигнал → открытие позиции."""
+        self._activate_cooldown(symbol)
+        self._log_signal(symbol, side, price, pipeline)
         result = await self.trader.execute_signal(symbol, side, price)
         if result:
             await self.trade_notifier.trade_opened(
@@ -470,6 +526,10 @@ class TradingBot:
                     logger.debug("Pipeline active, skipping aggregation signal")
                     continue
 
+                if self._is_on_cooldown(best["symbol"]):
+                    logger.info("Cooldown active for %s, skipping signal", best["symbol"])
+                    continue
+
                 logger.info("🎯 Biggest liquidation spike: %s %s $%.0f",
                              best["symbol"], best["side"], best["amount"])
 
@@ -512,11 +572,13 @@ class TradingBot:
 
         await self.notifier.send(
             f"📡 <b>Liquidation Bot запущен</b>\n"
-            f"Биржа: Bybit (все символы)\n"
+            f"Биржа: Bybit (все символы, без BTC/ETH)\n"
             f"Мониторинг: <b>{len(self.symbols)} пар</b>\n"
             f"LONG порог: ${Config.BYBIT_LONG_THRESHOLD:,.0f}\n"
             f"SHORT порог: ${Config.BYBIT_SHORT_THRESHOLD:,.0f}\n"
             f"Агрегация: {Config.BYBIT_AGGREGATION_INTERVAL}с\n"
+            f"Cooldown: {Config.SYMBOL_COOLDOWN_SECONDS}с\n"
+            f"Stop buffer: {Config.STOP_BUFFER_PCT:.2%}\n"
             f"BB({Config.BOLLINGER_PERIOD}, {Config.BOLLINGER_STD})\n"
             f"───────────────\n"
             f"{trade_status}"

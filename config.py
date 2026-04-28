@@ -21,6 +21,9 @@ class Config:
     BYBIT_SHORT_THRESHOLD = float(os.getenv("BYBIT_SHORT_THRESHOLD", "50000"))
     # Интервал агрегации ликвидаций (секунды)
     BYBIT_AGGREGATION_INTERVAL = int(os.getenv("BYBIT_AGGREGATION_INTERVAL", "10"))
+    STOP_BUFFER_PCT = float(os.getenv("STOP_BUFFER_PCT", "0.0015"))
+    SYMBOL_COOLDOWN_SECONDS = int(os.getenv("SYMBOL_COOLDOWN_SECONDS", "900"))
+    SIGNAL_LOG_CSV = os.getenv("SIGNAL_LOG_CSV", "signals.csv")
 
     # Price Reclaim — цена должна вернуться через экстремум выноса
     # Процент отката от экстремума для подтверждения reclaim (0.002 = 0.2%)
