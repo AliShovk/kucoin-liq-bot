@@ -7,7 +7,12 @@ logger = logging.getLogger(__name__)
 
 INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info?category=linear"
 
-EXCLUDED_SYMBOLS = {"BANANAS31USDT", "PUMPFUNUSDT", "BTCUSDT", "ETHUSDT"}
+EXCLUDED_SYMBOLS = {"BANANAS31USDT", "PUMPFUNUSDT"}
+EXCLUDED_BASE_PREFIXES = ("BTC", "ETH")
+
+
+def _is_excluded_symbol(symbol: str) -> bool:
+    return symbol in EXCLUDED_SYMBOLS or symbol.startswith(EXCLUDED_BASE_PREFIXES)
 
 
 async def fetch_all_symbols() -> list[str]:
@@ -22,7 +27,7 @@ async def fetch_all_symbols() -> list[str]:
                 data = await resp.json()
                 for item in data.get("result", {}).get("list", []):
                     sym = item.get("symbol", "")
-                    if sym and sym not in EXCLUDED_SYMBOLS:
+                    if sym and not _is_excluded_symbol(sym):
                         symbols.append(sym)
         logger.info("Fetched %d active Bybit linear symbols", len(symbols))
     except Exception as e:

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from telegram import Bot
 from telegram.constants import ParseMode
@@ -16,15 +17,25 @@ class TelegramNotifier:
         self.chat_id = chat_id
 
     async def send(self, text: str):
-        try:
-            await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-            )
-            logger.info("TG sent: %s", text[:80])
-        except Exception as e:
-            logger.error("TG send error: %s", e)
+        for attempt in range(3):
+            try:
+                await self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    read_timeout=30,
+                    write_timeout=30,
+                    connect_timeout=30,
+                    pool_timeout=30,
+                )
+                logger.info("TG sent: %s", text[:80])
+                return
+            except Exception as e:
+                if attempt == 2:
+                    logger.error("TG send error: %s", e)
+                    return
+                logger.warning("TG send retry %d after error: %s", attempt + 1, e)
+                await asyncio.sleep(2 * (attempt + 1))
 
     async def stage_1_liquidation(self, symbol: str, side: str, size_usd: float,
                                    batch_count: int = 1, batch_summary: str = ""):
